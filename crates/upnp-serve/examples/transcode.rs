@@ -11,10 +11,12 @@ use anyhow::Context;
 use axum::{
     Router,
     body::Body,
+    extract::State,
     response::{IntoResponse, Response},
     routing::get,
 };
 use axum_extra::response::FileStream;
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use librqbit_upnp_serve::{
     UpnpServer, UpnpServerOptions,
@@ -85,7 +87,7 @@ async fn handler_serve_byte_seek(headers: HeaderMap) -> Response {
     }
 }
 
-async fn handler_example_ts(headers: HeaderMap) -> Response {
+async fn handler_example_ts(State(port): State<u16>, headers: HeaderMap) -> Response {
     // parse seek headers and other DLNA headers if needed, emit dlna headers necessary
     // just passthrough as mpegts
     // ~/Movies/big_buck_bunny_720p_h264.mov
@@ -156,6 +158,7 @@ async fn handler_example_ts(headers: HeaderMap) -> Response {
     ffmpeg.args(["-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]);
 
     // e.g. dts, truhd
+    // TODO: compute from ffprobe and cache
     let unsupported_audio_streams = [2];
     for id in unsupported_audio_streams {
         ffmpeg.arg(dbg!(format!("-c:{id}"))).arg("ac3");
@@ -248,6 +251,7 @@ async fn handler_example_ts(headers: HeaderMap) -> Response {
     );
 
     let stdout = tokio_util::io::ReaderStream::new(stdout);
+    let stdout = nulls::MpegTsNullStuffer::new(stdout, Duration::from_millis(100));
     (status, output_headers, Body::from_stream(stdout)).into_response()
 }
 
@@ -339,4 +343,77 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(f1, f2, f3)?;
     Ok(())
+}
+
+mod nulls {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use bytes::Bytes;
+    use futures::Stream;
+    use tokio::time::{Sleep, sleep};
+
+    const NULL_MPEGTS_PACKET_RAW: [u8; 188] = {
+        let mut p = [0xFFu8; 188];
+        p[0] = 0x47;
+        p[1] = 0x1F;
+        p[2] = 0xFF;
+        p[3] = 0x10;
+        p
+    };
+    static NULL_MPEGTS_PACKET: Bytes = Bytes::from_static(&NULL_MPEGTS_PACKET_RAW);
+
+    pub struct MpegTsNullStuffer<S> {
+        inner: Pin<Box<S>>,
+        deadline: Pin<Box<Sleep>>,
+        timeout: Duration,
+    }
+
+    impl<S> MpegTsNullStuffer<S>
+    where
+        S: Stream<Item = io::Result<Bytes>>,
+    {
+        pub fn new(inner: S, timeout: Duration) -> Self {
+            Self {
+                deadline: Box::pin(sleep(timeout)),
+                inner: Box::pin(inner),
+                timeout,
+            }
+        }
+    }
+
+    impl<S> Stream for MpegTsNullStuffer<S>
+    where
+        S: Stream<Item = io::Result<Bytes>>,
+    {
+        type Item = io::Result<Bytes>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let timeout = self.timeout;
+
+            // Real data takes priority
+            if let Poll::Ready(item) = self.inner.as_mut().poll_next(cx) {
+                // Reset deadline on any data
+                self.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + timeout);
+                return Poll::Ready(item);
+            }
+
+            // No data yet — check if deadline has fired
+            if self.deadline.as_mut().poll(cx).is_ready() {
+                self.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + timeout);
+                tracing::trace!("stuffing nulls!");
+                return Poll::Ready(Some(Ok(NULL_MPEGTS_PACKET.clone())));
+            }
+
+            Poll::Pending
+        }
+    }
 }
